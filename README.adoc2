@@ -1,0 +1,31 @@
+= AWS CLI インストールと設定
+
+== 1. AWS CLIのインストール
+公式サイトからAWS CLIをダウンロードしてインストールします。
+リンク: https://aws.amazon.com/cli/
+
+インストール後、ターミナルを開き、以下のコマンドでインストールが成功したか確認します。
+
+[source,bash]
+----っっf
+aws --version
+----
+
+== 2. AWS CLIの設定
+AWS CLIのプロファイルを設定します。
+
+ターミナルで以下のコマンドを実行して、ダミープロファイルを設定します。
+
+[source,bash]
+----
+aws configure --profile dummy
+----
+
+プロンプトに従って、以下の情報を入力します。
+
+* AWS Access Key ID: 任意のダミーアクセスキー（例：dummyAccessKey）
+* AWS Secret Access Key: 任意のダミーシークレットキー（例：dummySecretKey）
+* Default region name: 任意のリージョン（例：us-east-1）
+* Default output format: 任意の出力形式（例：json）
+
+
