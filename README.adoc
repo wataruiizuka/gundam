@@ -1,0 +1,76 @@
+= lazs-pazs
+
+== lazs-pazs システム概要
+- https://docs.google.com/presentation/d/1_vnUexu5jqnH7EqdcsXqnNlaQmW576ugcoZ-gAN8-dw/edit#slide=id.p[pazs-etl概要]
+
+== 資料置き場
+- link:https://www.notion.so/ss-adtech/pazs-idsync-f6ea0ca63ada42949063495f1f9cec45[idsyncの資料]
+- link:https://www.notion.so/ss-adtech/pazs-idsync-license-575d78dbbeca442190fb40a3c28ebe34[idsync-licenseの資料]
+- link:https://www.notion.so/ss-adtech/pazs-decryptor-85ed1c0aa9a94553afe68201e7cd0e2d[decryptorの資料]
+
+== 各ディレクトリの役割
+- link:https://docs.google.com/spreadsheets/d/1Hh20tnb0_MfBzdshrF6r-DWBKoraCB-EtDrG5PzFx9I/edit?gid=891834841#gid=891834841[pazs各ディレクトリの役割]
+
+== ダミープロファイルの作成
+- link:https://docs.google.com/document/d/1HfMWSYazjvxAHPae4TpXFvSmM7SeXasBq3uFvAXQhOI/edit#heading=h.1ms6nwlhc6tq[ダミープロファイルの作成手順]
+
+== clone後のおおまかなテスト環境の構築手順について
+- 各ディレクトリのTOPは要確認
+- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/decryptor[decryptor]
+- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/idsync[idsync]
+- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/license[license]
+
+=== 環境設定
+- env.goファイルに記載された環境変数を設定
+
+[source,bash]
+----
+find . -name "env.go"
+----
+
+=== DynamoDBテーブルの作成
+- 必要なDynamoDBテーブルを作成
+
+[source,bash]
+----
+make create-all-table
+----
+
+=== SNSトピックの作成
+[source,bash]
+----
+aws sns create-topic --name idsync-test --endpoint-url http://localhost:9911 --profile dummy
+----
+
+=== SQSトピックの作成
+[source,bash]
+----
+aws sqs create-queue --queue-name idsync-test --endpoint-url http://localhost:9324 --profile dummy
+----
+
+=== ビルドとデプロイ
+アプリケーションのビルド
+[source,bash]
+----
+make build
+----
+
+=== アプリケーションの起動
+[source,bash]
+----
+make start
+----
+
+=== テストの実行
+[source,bash]
+----
+make test
+----
+
+=== SNS が動作しない時
+
+M1macをご利用の際は以下の手順で問題を解決できます。
+
+. *M1 Mac を使用している場合、link:https://github.com/supership-jp/lazs-pazs/blob/main/apis/idsync/sns/Makefile#L2[Dockerイメージ]を `jameskbride/local-sns` に変更する。*
+
+. *MakefileのSNS系コマンド実行時のオプションに --profile の指定がないので、dynamodb、sqsと合わせる形で、link:https://github.com/supership-jp/lazs-pazs/blob/main/apis/idsync/Makefile#L31[SNS_OPTIONS]に --profile $(AWS_PROFILE) を加える*
