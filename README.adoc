@@ -1,76 +1,952 @@
-= lazs-pazs
+以下、**そのままMarkdownに貼り付けられる形式**で提示します。
 
-== lazs-pazs システム概要
-- https://docs.google.com/presentation/d/1_vnUexu5jqnH7EqdcsXqnNlaQmW576ugcoZ-gAN8-dw/edit#slide=id.p[pazs-etl概要]
+---
 
-== 資料置き場
-- link:https://www.notion.so/ss-adtech/pazs-idsync-f6ea0ca63ada42949063495f1f9cec45[idsyncの資料]
-- link:https://www.notion.so/ss-adtech/pazs-idsync-license-575d78dbbeca442190fb40a3c28ebe34[idsync-licenseの資料]
-- link:https://www.notion.so/ss-adtech/pazs-decryptor-85ed1c0aa9a94553afe68201e7cd0e2d[decryptorの資料]
+````markdown
+# Microsoft Fabric 実装想定まとめ  
+## — 初級エンジニア・非エンジニア向け解説 —
 
-== 各ディレクトリの役割
-- link:https://docs.google.com/spreadsheets/d/1Hh20tnb0_MfBzdshrF6r-DWBKoraCB-EtDrG5PzFx9I/edit?gid=891834841#gid=891834841[pazs各ディレクトリの役割]
+## 0. 前提
 
-== ダミープロファイルの作成
-- link:https://docs.google.com/document/d/1HfMWSYazjvxAHPae4TpXFvSmM7SeXasBq3uFvAXQhOI/edit#heading=h.1ms6nwlhc6tq[ダミープロファイルの作成手順]
+今回の前提は以下です。
 
-== clone後のおおまかなテスト環境の構築手順について
-- 各ディレクトリのTOPは要確認
-- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/decryptor[decryptor]
-- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/idsync[idsync]
-- link:https://github.com/supership-jp/lazs-pazs/tree/main/apis/license[license]
+```text
+・Cloudera側に Kudu と Iceberg がある
+・Kudu は直近・カレントデータ用途
+・Iceberg は履歴・トランザクションデータ用途
+・まずは Iceberg 形式のデータを Fabric から参照する検証を進める
+・Fabric の価値を QCD、つまり Quality / Cost / Delivery で評価する
+````
 
-=== 環境設定
-- env.goファイルに記載された環境変数を設定
+今回のFabric実装は、いきなりCloudera全体を置き換える話ではありません。
 
-[source,bash]
-----
-find . -name "env.go"
-----
+まずは、すでにCloudera側で用意されている **Iceberg形式のデータ** を対象に、Fabricから参照・分析・可視化できるかを検証する取り組みです。
 
-=== DynamoDBテーブルの作成
-- 必要なDynamoDBテーブルを作成
+---
 
-[source,bash]
-----
-make create-all-table
-----
+# 1. 想定される構成
 
-=== SNSトピックの作成
-[source,bash]
-----
-aws sns create-topic --name idsync-test --endpoint-url http://localhost:9911 --profile dummy
-----
+## 1.1 全体像
 
-=== SQSトピックの作成
-[source,bash]
-----
-aws sqs create-queue --queue-name idsync-test --endpoint-url http://localhost:9324 --profile dummy
-----
+今回の現実的な初期構成は、以下のようになります。
 
-=== ビルドとデプロイ
-アプリケーションのビルド
-[source,bash]
-----
-make build
-----
+```text
+Cloudera 基盤
+├─ Kudu
+│   └─ 直近・カレントデータ
+│      Webアプリの検索・絞り込み用
+│
+└─ Iceberg
+    └─ 履歴・トランザクションデータ
+       Fabric から参照する主対象
+          ↓
+Microsoft Fabric
+├─ OneLake Shortcut
+│   └─ Iceberg データを仮想参照
+│
+├─ Lakehouse
+│   └─ 分析・加工用の領域
+│
+├─ Warehouse
+│   └─ BI向けの集計済みデータマート
+│
+├─ Dataflow Gen2 / Pipeline / Notebook
+│   └─ データ整形・加工・自動実行
+│
+└─ Power BI
+    └─ レポート・ダッシュボード表示
+```
 
-=== アプリケーションの起動
-[source,bash]
-----
-make start
-----
+一番重要なのは、まずは **Kuduではなく、Icebergを中心にFabric連携を検証する** という点です。
 
-=== テストの実行
-[source,bash]
-----
-make test
-----
+理由は、議事録上では以下のように整理されているためです。
 
-=== SNS が動作しない時
+| データ形式   | 主な役割                 | Fabricからの扱い  |
+| ------- | -------------------- | ------------ |
+| Kudu    | 直近・カレントデータ、Webアプリ検索用 | 直接アクセス不可     |
+| Iceberg | 履歴・トランザクションデータ、分析用   | Fabricから参照可能 |
 
-M1macをご利用の際は以下の手順で問題を解決できます。
+---
 
-. *M1 Mac を使用している場合、link:https://github.com/supership-jp/lazs-pazs/blob/main/apis/idsync/sns/Makefile#L2[Dockerイメージ]を `jameskbride/local-sns` に変更する。*
+# 2. 構成パターン
 
-. *MakefileのSNS系コマンド実行時のオプションに --profile の指定がないので、dynamodb、sqsと合わせる形で、link:https://github.com/supership-jp/lazs-pazs/blob/main/apis/idsync/Makefile#L31[SNS_OPTIONS]に --profile $(AWS_PROFILE) を加える*
+Fabric実装には、大きく3つのパターンがあります。
+
+---
+
+## 2.1 パターンA：IcebergをFabricから仮想参照する構成
+
+今回のPoCでは、まずこの構成が最も現実的です。
+
+```text
+Cloudera / Iceberg
+    ↓
+OneLake Shortcut
+    ↓
+Fabric Lakehouse
+    ↓
+Power BI
+```
+
+## 分かりやすく言うと
+
+データそのものはCloudera側に置いたまま、Fabricからは「ここにデータがあります」と見に行く構成です。
+
+```text
+データを引っ越ししない
+Fabricから元の場所を見に行く
+```
+
+## メリット
+
+| 観点     | 内容                           |
+| ------ | ---------------------------- |
+| コスト    | データを二重に持たないため、ストレージコストを抑えやすい |
+| 開発スピード | 大量移行を待たずに検証を始めやすい            |
+| 鮮度     | 元データを参照するため、コピー遅延を減らせる可能性がある |
+| PoC向き  | まずFabricの接続性・参照性能を確認しやすい     |
+
+## デメリット
+
+| 観点      | 内容                           |
+| ------- | ---------------------------- |
+| 速度      | 物理的にFabric内に置くより遅い可能性がある     |
+| ネットワーク  | Cloudera側への参照経路がボトルネックになる可能性 |
+| 権限      | Cloudera側とFabric側の権限管理の整合が必要 |
+| Kudu非対応 | Kudu上の最新データはこの構成だけでは扱えない     |
+
+## 向いている用途
+
+```text
+・Power BIで履歴データを分析する
+・Iceberg上のトランザクションデータを可視化する
+・データ移行せずにFabricの価値を検証する
+・まずはQCDを小さく検証する
+```
+
+---
+
+## 2.2 パターンB：IcebergデータをFabricへ物理コピーする構成
+
+```text
+Cloudera / Iceberg
+    ↓
+Data Factory / Copy Job
+    ↓
+Fabric OneLake / Lakehouse
+    ↓
+Fabric上で加工
+    ↓
+Warehouse / Power BI
+```
+
+## 分かりやすく言うと
+
+Cloudera側のデータをFabric側へコピーして、Fabric内にデータを持つ構成です。
+
+```text
+ClouderaからFabricへデータを引っ越しする
+Fabric内で分析・加工・BI表示する
+```
+
+## メリット
+
+| 観点         | 内容                                  |
+| ---------- | ----------------------------------- |
+| 速度         | Fabric内にデータがあるため、Power BI連携を最適化しやすい |
+| AI活用       | Fabric内のデータとして生成AI・分析機能を使いやすい       |
+| 加工         | Spark、SQL、Dataflow Gen2で加工しやすい      |
+| Cloudera負荷 | BI参照をFabric側に逃がせる可能性がある             |
+
+## デメリット
+
+| 観点   | 内容                             |
+| ---- | ------------------------------ |
+| コスト  | Fabric側にもデータを保存するためストレージ費用が増える |
+| 運用   | コピー処理、差分連携、監視が必要               |
+| 鮮度   | コピータイミング分の遅延が発生する              |
+| 二重管理 | ClouderaとFabricで同じデータを持つことになる  |
+
+## 向いている用途
+
+```text
+・Power BIを高速化したい
+・Fabric内でAI分析や高度な加工をしたい
+・Clouderaへの参照負荷を減らしたい
+・将来的にFabric中心のデータ基盤を検討したい
+```
+
+---
+
+## 2.3 パターンC：Kuduは現行維持、Iceberg/Fabricは分析用途に分ける構成
+
+今回の現実的な本番候補は、このハイブリッド構成です。
+
+```text
+Webアプリ
+  ↓
+Kudu / キャッシュ / 事前計算
+  ↓
+直近データ検索・絞り込み
+
+Power BI / 分析
+  ↓
+Fabric
+  ↓
+Iceberg / Lakehouse / Warehouse
+  ↓
+履歴分析・集計・可視化
+```
+
+## 分かりやすく言うと
+
+```text
+Webアプリの速さはKuduやキャッシュで維持する
+Power BIや分析用途はFabricで強化する
+```
+
+## メリット
+
+| 観点      | 内容                     |
+| ------- | ---------------------- |
+| 現実性     | Kuduの強みを残しつつFabricを使える |
+| 役割分担    | WebアプリとBI分析を分けて考えられる   |
+| リスク低減   | いきなり全基盤を置き換えない         |
+| PoCしやすい | Iceberg側から段階的に検証できる    |
+
+## デメリット
+
+| 観点     | 内容                                    |
+| ------ | ------------------------------------- |
+| 構成が複雑  | Kudu、Iceberg、Fabricの役割整理が必要           |
+| データ整合性 | WebアプリとPower BIで見ているデータ差分に注意          |
+| 鮮度管理   | Kuduの最新データがいつIceberg/Fabricに反映されるか要確認 |
+
+今回のPoCでは、最初からKuduまでFabric化しようとせず、**Kuduは現行維持、IcebergをFabricで活用する構成** を第一候補にするのが現実的です。
+
+---
+
+# 3. 推奨アーキテクチャ
+
+## 3.1 初期PoC構成
+
+```text
+Cloudera Iceberg
+    ↓
+OneLake Shortcut
+    ↓
+Fabric Lakehouse
+    ↓
+Power BI
+```
+
+目的は、**データをコピーせずにFabricからIcebergを参照した場合、どれくらい使えるか**を確認することです。
+
+---
+
+## 3.2 比較検証構成
+
+```text
+Cloudera Iceberg
+    ↓
+① Shortcutで仮想参照
+    ↓
+Power BI
+
+Cloudera Iceberg
+    ↓
+② Fabricへ物理コピー
+    ↓
+Lakehouse / Warehouse
+    ↓
+Power BI
+```
+
+目的は、以下を比較することです。
+
+| 比較項目        | Shortcut方式 | 物理コピー方式   |
+| ----------- | ---------- | --------- |
+| 速度          | 要検証        | 速くしやすい可能性 |
+| コスト         | 低め         | 高め        |
+| 鮮度          | 高めの可能性     | コピー遅延あり   |
+| 運用          | 比較的軽い      | コピー監視が必要  |
+| Power BI最適化 | 制約がある可能性   | 最適化しやすい   |
+
+---
+
+## 3.3 将来構成候補
+
+```text
+Kudu
+  └─ Webアプリのカレント検索用
+
+Iceberg
+  └─ 履歴・トランザクション蓄積用
+       ↓
+Fabric
+  ├─ Shortcutで参照
+  ├─ 必要に応じて物理コピー
+  ├─ Lakehouseで加工
+  ├─ WarehouseでBI用データマート化
+  └─ Power BIで可視化
+```
+
+この構成では、KuduとFabricを無理に競合させません。
+
+```text
+Kudu：最新データの高速検索
+Iceberg：履歴データの蓄積
+Fabric：分析・BI・AI活用
+Power BI：可視化
+```
+
+という役割分担にします。
+
+---
+
+# 4. 詳細な手順と作業内容
+
+---
+
+## Step 0：PoCの目的を明確にする
+
+最初に、何を検証するのかを決めます。
+
+## 作業内容
+
+| 作業        | 内容                            |
+| --------- | ----------------------------- |
+| 対象データを決める | Icebergのどのテーブルを使うか決める         |
+| 対象画面を決める  | Power BIのどの帳票、Webアプリのどの画面か決める |
+| 評価指標を決める  | 速度、コスト、工数、鮮度など                |
+| 比較対象を決める  | 現行Cloudera、Shortcut、物理コピーなど   |
+| 成功条件を決める  | 例：表示時間を何秒以内にする、など             |
+
+## ここで決めるべきこと
+
+```text
+・PoC対象はPower BI中心か
+・Webアプリも含めるか
+・Kuduは対象外でよいか
+・Icebergだけで初期検証するか
+・Shortcut方式と物理コピー方式を比較するか
+```
+
+このStep 0を曖昧にすると、後で「何が成功だったのか分からないPoC」になります。
+
+---
+
+## Step 1：現行構成を整理する
+
+まず、今のデータの流れを整理します。
+
+## 作業内容
+
+| 作業           | 内容                              |
+| ------------ | ------------------------------- |
+| Kuduの役割整理    | どのWebアプリ画面がKuduを見ているか           |
+| Icebergの役割整理 | どの履歴データ・トランザクションデータがあるか         |
+| データ更新頻度確認    | Kudu、Icebergが何分・何時間・何日単位で更新されるか |
+| 現行レスポンス確認    | Webアプリ、Power BI、SQLの現状速度        |
+| エラー率確認       | 既存改善後のエラー率・安定性                  |
+| 既存キャッシュ確認    | どこで事前計算・キャッシュしているか              |
+
+## 初級者向けの理解
+
+これは「今の家の配線図を書く」作業です。
+
+```text
+どこにデータがあるか
+どこを通って画面に出ているか
+どこが遅いのか
+どこはすでに改善済みなのか
+```
+
+を整理します。
+
+---
+
+## Step 2：Fabric環境を準備する
+
+Fabricを使うための基本環境を作ります。
+
+## 作業内容
+
+| 作業           | 内容                                |
+| ------------ | --------------------------------- |
+| Fabricテナント確認 | 組織でFabricを使える状態か確認                |
+| Capacity確認   | PoCで使うFabric容量を確認                 |
+| Workspace作成  | PoC用の作業場所を作る                      |
+| 権限付与         | 作業者、閲覧者、管理者の権限を設定                 |
+| 管理者設定確認      | Fabric機能、Shortcut、外部接続が許可されているか確認 |
+| 監視設定         | Capacity Metricsなどを確認できるようにする     |
+
+## 注意点
+
+PoC用のFabric容量が小さすぎると、Fabricの性能ではなく、単にリソース不足で遅く見える可能性があります。
+
+---
+
+## Step 3：Icebergへの接続方式を決める
+
+今回の中心作業です。
+
+## 候補1：Shortcutで参照する
+
+```text
+Iceberg
+  ↓
+OneLake Shortcut
+  ↓
+Fabric Lakehouse
+```
+
+## 候補2：Fabricへコピーする
+
+```text
+Iceberg
+  ↓
+Data Factory / Copy Job
+  ↓
+Fabric Lakehouse
+```
+
+## 作業内容
+
+| 作業            | 内容                      |
+| ------------- | ----------------------- |
+| Iceberg格納場所確認 | ADLS、S3互換、オンプレストレージなど   |
+| Shortcut対応確認  | FabricからShortcutを作れる形式か |
+| 認証確認          | どのID・資格情報で参照するか         |
+| ネットワーク確認      | Fabricからデータ配置場所に到達できるか  |
+| 権限確認          | Fabric利用者がデータを見られるか     |
+| 小規模テーブルで接続試験  | まず少量データで接続確認            |
+
+## 重要な注意点
+
+議事録上「IcebergならFabricから参照可能」と整理されていますが、実際には以下の確認が必要です。
+
+```text
+・Icebergテーブルの実体ファイルがどこにあるか
+・FabricのShortcutがその保管場所をサポートしているか
+・ネットワーク的に参照できるか
+・認証方式が対応しているか
+・メタデータを正しく解釈できるか
+```
+
+---
+
+## Step 4：Fabric Lakehouseを作成する
+
+Lakehouseは、Fabric上でデータを分析・加工するための作業場所です。
+
+## 作業内容
+
+| 作業          | 内容                    |
+| ----------- | --------------------- |
+| Lakehouse作成 | PoC用Lakehouseを作る      |
+| Shortcut作成  | Icebergデータへの参照を作る     |
+| テーブル確認      | Fabric上でテーブルとして見えるか確認 |
+| サンプルクエリ実行   | 件数確認、期間確認、NULL確認など    |
+| データ型確認      | 日付、数値、文字列が想定通りか確認     |
+
+## 初級者向けの理解
+
+Lakehouseは、Fabric上の「分析用の作業部屋」です。
+ここにデータを見えるようにして、集計したり、Power BIにつないだりします。
+
+---
+
+## Step 5：データ品質を確認する
+
+接続できても、データが正しいとは限りません。
+
+## 作業内容
+
+| 作業     | 内容                         |
+| ------ | -------------------------- |
+| 件数確認   | Cloudera側とFabric側で件数が一致するか |
+| 日付範囲確認 | 想定期間のデータがあるか               |
+| NULL確認 | 重要カラムにNULLが多すぎないか          |
+| 重複確認   | 主キー・JOINキーが重複していないか        |
+| 型確認    | 数値・日付・文字列が正しく解釈されているか      |
+| 集計値確認  | 売上、件数、ユーザー数などが一致するか        |
+
+## 確認SQL例の考え方
+
+```sql
+-- 件数確認
+SELECT COUNT(*) FROM 対象テーブル;
+
+-- 日付範囲確認
+SELECT MIN(取引日), MAX(取引日) FROM 対象テーブル;
+
+-- 重複確認
+SELECT キー項目, COUNT(*)
+FROM 対象テーブル
+GROUP BY キー項目
+HAVING COUNT(*) > 1;
+```
+
+## 注意点
+
+この段階でCloudera側とFabric側の数値が合わない場合、速度検証に進んではいけません。
+
+まず、以下を確認します。
+
+```text
+・同じテーブルを見ているか
+・同じ期間を見ているか
+・同じフィルタ条件か
+・同じ更新タイミングか
+・同じ集計ロジックか
+```
+
+---
+
+## Step 6：Power BI接続方式を決める
+
+Power BIからFabricを見る方式を決めます。
+
+## 主な方式
+
+| 方式          | 内容                    | 向いているケース        |
+| ----------- | --------------------- | --------------- |
+| Import      | Power BIにデータを取り込む     | データ量が小さい、速度重視   |
+| DirectQuery | 元データに都度問い合わせる         | 鮮度重視だが速度に注意     |
+| Direct Lake | OneLake上のDeltaテーブルを利用 | 大量データを高速分析したい場合 |
+
+## 今回のおすすめ
+
+| 用途          | おすすめ方式                 |
+| ----------- | ---------------------- |
+| Gold集計済みデータ | Import または Direct Lake |
+| 大量の履歴データ    | Direct Lake            |
+| 常に最新データ     | DirectQueryも候補だが速度検証必須 |
+| 初期PoC       | ImportとDirect Lakeを比較  |
+
+## 注意点
+
+Power BIの速度はFabricだけでは決まりません。
+
+```text
+・データ量
+・列数
+・リレーション設計
+・DAX
+・ビジュアル数
+・フィルタ数
+・RLS
+・接続方式
+```
+
+これらすべてが影響します。
+
+---
+
+## Step 7：必要に応じてGoldデータを作る
+
+IcebergのSilver相当データをそのままPower BIで見ると、重くなる場合があります。
+その場合、Fabric上でBI用に集計済みのGoldデータを作ります。
+
+## データの流れ
+
+```text
+Iceberg / Silver
+  ↓
+Fabric Lakehouse
+  ↓
+Notebook / SQL / Dataflow Gen2
+  ↓
+Goldテーブル
+  ↓
+Power BI
+```
+
+## 作業内容
+
+| 作業         | 内容                  |
+| ---------- | ------------------- |
+| 必要カラム選定    | Power BIで使う列だけに絞る   |
+| 集計粒度決定     | 日次、月次、店舗別、商品別など     |
+| JOIN処理     | 店舗マスタ、商品マスタ、会員マスタなど |
+| 指標計算       | 売上、件数、客単価、点数など      |
+| Goldテーブル作成 | Power BIが読みやすい形にする  |
+| 性能確認       | Gold化前後で速度比較        |
+
+## 初級者向けの理解
+
+Silverは「材料がたくさん入った倉庫」です。
+Goldは「料理済みで、すぐお客様に出せる状態」です。
+
+Power BIやWebアプリで速く表示したい場合は、Goldを作る方が有利です。
+
+---
+
+## Step 8：WebアプリからFabricを使うか判断する
+
+ここは慎重に判断する必要があります。
+
+## Webアプリの特性
+
+WebアプリはPower BIと違い、ユーザーが検索・絞り込みを行い、すぐ結果を返す必要があります。
+
+| 観点       | Webアプリ                    |
+| -------- | ------------------------- |
+| 要求速度     | 非常に速いレスポンスが必要             |
+| データ      | 最新・カレントデータが必要なことが多い       |
+| 参照先      | Kudu、キャッシュ、事前計算テーブルが向きやすい |
+| Fabric適性 | 履歴分析や集計結果参照なら候補           |
+
+## 判断基準
+
+| パターン           | 判断                         |
+| -------------- | -------------------------- |
+| 最新データを即時検索したい  | Kudu / キャッシュ継続が現実的         |
+| 履歴集計を表示したい     | Fabric Goldを参照する候補あり       |
+| 大量データを都度検索したい  | Fabric直参照は要性能検証            |
+| 事前計算済み結果を表示したい | Fabric Warehouse / Goldが候補 |
+
+## 推奨
+
+初期PoCでは、WebアプリをいきなりFabric直参照にしない方がよいです。
+
+まずは以下が現実的です。
+
+```text
+Power BI：Fabricで検証
+Webアプリ：現行Kudu / キャッシュを維持
+Webアプリ向け集計結果だけFabric活用を検討
+```
+
+---
+
+## Step 9：性能を測定する
+
+PoCでは、体感ではなく数値で評価します。
+
+## 測定項目
+
+| 分類       | 測定項目                              |
+| -------- | --------------------------------- |
+| Power BI | 初回表示時間、フィルタ変更時間、ページ切替時間           |
+| Fabric   | Shortcut参照時間、SQL実行時間、Notebook実行時間 |
+| データ連携    | コピー時間、差分連携時間                      |
+| Webアプリ   | APIレスポンスタイム、タイムアウト率、エラー率          |
+| コスト      | Capacity使用量、ストレージ量、ライセンス          |
+| 運用       | ジョブ失敗回数、再実行時間、監視工数                |
+
+## 比較軸
+
+```text
+現行Cloudera
+vs
+Fabric Shortcut
+vs
+Fabric物理コピー
+vs
+Fabric Gold化後
+```
+
+## 注意点
+
+アプリ側改修で既に99.1%改善が出ている場合、Fabricの効果と混ぜてはいけません。
+
+```text
+アプリ改修後の現行値
+  ↓
+Fabric導入後の値
+
+この差分だけをFabric効果として見る
+```
+
+---
+
+## Step 10：QCDで評価する
+
+今回のPoCではQCD評価が重要です。
+
+---
+
+## Quality：品質・速度・安定性
+
+| 評価項目 | 内容                       |
+| ---- | ------------------------ |
+| 表示速度 | Power BIやWebアプリが速くなるか    |
+| 安定性  | エラーやタイムアウトが減るか           |
+| 鮮度   | データがどれくらい早く反映されるか        |
+| 正確性  | ClouderaとFabricで数値が一致するか |
+
+---
+
+## Cost：コスト
+
+| 評価項目            | 内容                      |
+| --------------- | ----------------------- |
+| Fabric Capacity | どの程度の容量が必要か             |
+| ストレージ           | 物理コピーする場合の保存費用          |
+| Cloudera負荷      | 既存基盤の負荷を減らせるか           |
+| ライセンス           | Power BI / Fabric利用者の費用 |
+| 運用費             | 監視・障害対応・保守工数            |
+
+---
+
+## Delivery：開発・導入スピード
+
+| 評価項目   | 内容                       |
+| ------ | ------------------------ |
+| 接続工数   | Iceberg接続にどれくらいかかるか      |
+| 開発工数   | Goldテーブル作成やPower BI修正の工数 |
+| 移行工数   | Cloudera処理を移す必要があるか      |
+| 運用開始まで | 本番化までの期間                 |
+| 属人性    | Fabric有識者がいないと運用できないか    |
+
+---
+
+# 5. 知っておいたほうがいい情報
+
+## 5.1 Fabricは「BIを速くするだけの製品」ではない
+
+Fabricは、Power BIの裏側に置く単なる高速DBではありません。
+
+```text
+データ連携
+データ保存
+データ加工
+データ分析
+BI表示
+AI活用
+ガバナンス
+```
+
+をまとめて扱う基盤です。
+
+そのため、Fabricを導入する場合は、単に「Power BIが速くなるか」ではなく、**既存データ基盤のどの役割をFabricに持たせるのか**を決める必要があります。
+
+---
+
+## 5.2 Shortcutは「コピーしない」仕組み
+
+Shortcutは、データをFabricに移すのではなく、Fabricから外部データを見に行く仕組みです。
+
+```text
+実データ：Cloudera / Iceberg側
+見かけ上：Fabric / OneLake上にあるように見える
+```
+
+これはコストや移行工数を抑えられる反面、速度は実データの場所・ネットワーク・権限に依存します。
+
+したがって、Shortcutは「速い前提」で進めるのではなく、PoCで実測する必要があります。
+
+---
+
+## 5.3 IcebergとDeltaの違いに注意する
+
+議事録では、Cloudera側はIceberg、Fabric側はLakehouseやDirect Lakeの話が出ています。
+
+ここで注意すべきなのは、Fabric側のLakehouseやDirect LakeではDelta形式が関係する点です。
+
+そのため、次回以降は以下をMS社・ベンダーに必ず確認すべきです。
+
+```text
+Cloudera上のIcebergをFabricからShortcutした場合、
+Power BI Direct Lakeでどのように扱えるのか。
+
+Deltaとして扱える範囲、制約、性能条件は何か。
+```
+
+---
+
+## 5.4 Kuduは初期PoCでは切り離して考える
+
+議事録上、KuduはFabricから直接アクセスできないと整理されています。
+
+そのため、初期PoCでKuduまで含めると、検証が複雑になります。
+
+```text
+初期PoC：
+Iceberg × Fabric × Power BI
+
+次段階：
+Kudu × Impala経由 × Fabric
+または
+KuduデータをIceberg/Goldへ反映する方式
+```
+
+この順番が現実的です。
+
+---
+
+## 5.5 Fabricの性能はCapacityに依存する
+
+FabricはSaaSですが、無限に速いわけではありません。
+
+Fabricの処理能力はCapacityに依存します。
+
+PoCでは、必ず以下を記録します。
+
+```text
+・使用したFabric容量
+・同時利用者数
+・処理時間
+・Capacity使用率
+・スロットリング有無
+・Power BI表示時間
+```
+
+---
+
+## 5.6 Gold化は速度には有利、分析自由度には不利
+
+Goldデータは、集計済みなので速く表示しやすいです。
+
+ただし、明細が削られているため、後から細かい分析をしたい場合には不利です。
+
+| レイヤー   |      速度 | 分析自由度 | データ量 |
+| ------ | ------: | ----: | ---: |
+| Silver | 遅くなりやすい |    高い |   多い |
+| Gold   |  速くしやすい |    低い |  少ない |
+
+今回の設計では、以下の使い分けが現実的です。
+
+```text
+Power BI定型帳票：Gold
+詳細分析・AI活用：Silver
+Webアプリ表示：Goldまたはキャッシュ
+最新検索：Kudu
+```
+
+---
+
+# 6. その他：プロフェッショナル作業で必要な情報
+
+## 6.1 事前に必ず集めるべき情報
+
+Fabric実装前に、以下の情報が必要です。
+
+| 分類     | 必要情報                            |
+| ------ | ------------------------------- |
+| データ    | 対象テーブル名、件数、容量、更新頻度              |
+| 構造     | Kudu、Iceberg、Gold、Silverの対応関係   |
+| 業務     | どの画面・帳票で使うか                     |
+| 性能     | 現行レスポンスタイム、エラー率、同時利用者数          |
+| 権限     | 誰がどのデータを見られるか                   |
+| ネットワーク | FabricからCloudera/Icebergへ到達できるか |
+| コスト    | 現行コスト、Fabric想定容量、ライセンス          |
+| 運用     | 監視、障害対応、再実行手順                   |
+| セキュリティ | 個人情報、機密データ、監査ログ                 |
+
+---
+
+## 6.2 作成すべき成果物
+
+PoCを進めるなら、以下の資料を作るべきです。
+
+| 成果物      | 内容                                     |
+| -------- | -------------------------------------- |
+| アーキテクチャ図 | Kudu、Iceberg、Fabric、Power BI、Webアプリの関係 |
+| データフロー図  | データがどこからどこへ流れるか                        |
+| QCD評価表   | Quality / Cost / Deliveryの評価項目         |
+| 対象テーブル一覧 | Iceberg対象テーブル、Gold候補テーブル               |
+| 性能測定シート  | 現行値、Fabric値、差分                         |
+| リスク一覧    | 技術・運用・コスト・セキュリティリスク                    |
+| MS社への質問表 | 未確認事項を一覧化                              |
+| PoC実施手順書 | 誰が何をいつ実施するか                            |
+| 本番化判断表   | PoC後に採用可否を判断する材料                       |
+
+---
+
+## 6.3 MS社・ベンダーに確認すべき重要質問
+
+| No | 質問                                                   |
+| -: | ---------------------------------------------------- |
+|  1 | 今回のIcebergデータはFabric Shortcutで正式に扱える前提か              |
+|  2 | Iceberg Shortcut後、Power BI Direct Lakeで利用できる範囲と制約は何か |
+|  3 | Shortcut方式と物理コピー方式のどちらを推奨するか                         |
+|  4 | Shortcut時の性能ボトルネックはどこに出る可能性があるか                      |
+|  5 | Kudu上の最新データをFabricで扱う場合、Impala経由以外の選択肢はあるか           |
+|  6 | Fabric CapacityはPoC・本番でどのサイズを想定するか                   |
+|  7 | Power BIはImport、DirectQuery、Direct Lakeのどれを推奨するか     |
+|  8 | WebアプリからFabricを参照する場合、どのインターフェースを使うか                 |
+|  9 | 権限管理はCloudera側とFabric側でどう整合させるか                      |
+| 10 | 本番運用時の監視・障害対応は誰が担当するか                                |
+
+---
+
+# 7. まとめ
+
+今回Fabricを実装する場合、最初から全データ基盤を置き換えるのではなく、**IcebergデータをFabricから参照するPoC**から始めるのが現実的です。
+
+推奨する進め方は以下です。
+
+```text
+Step 1：
+現行構成を整理する
+
+Step 2：
+Icebergデータを対象にFabric Shortcutを作る
+
+Step 3：
+Fabric Lakehouseで参照できるか確認する
+
+Step 4：
+Power BIにつないで表示速度を測る
+
+Step 5：
+必要に応じてFabric内にGoldテーブルを作る
+
+Step 6：
+Shortcut方式と物理コピー方式を比較する
+
+Step 7：
+QCDで導入判断する
+```
+
+今回の重要な考え方は、以下です。
+
+```text
+Kuduは最新データ・Webアプリ検索向けに残す
+Icebergは履歴・分析データとしてFabric連携する
+FabricはPower BI分析・Gold作成・AI活用の基盤として使う
+```
+
+最初に目指すべき構成は、以下です。
+
+```text
+Cloudera Iceberg
+  ↓
+OneLake Shortcut
+  ↓
+Fabric Lakehouse
+  ↓
+Power BI
+```
+
+その上で、速度が不足する場合やFabric機能をより活用したい場合に、以下へ進みます。
+
+```text
+Cloudera Iceberg
+  ↓
+物理コピー
+  ↓
+Fabric Lakehouse / Warehouse
+  ↓
+Goldテーブル
+  ↓
+Power BI / Webアプリ
+```
+
+最終判断は、単純な速度だけではなく、以下のQCDで行うべきです。
+
+| 観点       | 判断内容                   |
+| -------- | ---------------------- |
+| Quality  | 速くなるか、安定するか、正しい数値が出るか  |
+| Cost     | Fabric容量、ストレージ、運用費が妥当か |
+| Delivery | 開発・接続・運用開始までの手間が減るか    |
+
+結論として、今回のFabric実装は、**Clouderaを即置き換える話ではなく、まずIcebergを起点にFabricを分析・BI活用レイヤーとして使えるかを検証する取り組み**として進めるのが最も安全で現実的です。
+
+```
+
+---
+```
